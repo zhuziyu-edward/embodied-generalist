@@ -41,6 +41,108 @@ def generate_fourier_features(pos, num_bands=10, max_freq=15, concat_pos=True, s
             [pos, per_pos_features.expand(batch_size, -1, -1)], dim=-1)
     return per_pos_features
 
+import torch.nn.functional as F
+
+def get_activation_fn(activation_type):
+    if activation_type not in ["relu", "gelu", "glu"]:
+        raise RuntimeError(f"activation function currently support relu/gelu, not {activation_type}")
+    return getattr(F, activation_type)
+
+class CrossAttentionLayer(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dropout=0.0,
+        activation="relu",
+        normalize_before=False,
+        batch_first=False,
+    ):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=batch_first, add_zero_attn=True
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        self.activation = get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def with_pos_embed(self, tensor, pos):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(
+        self,
+        tgt,
+        memory,
+        attn_mask=None,
+        memory_key_padding_mask=None,
+        pos=None,
+        query_pos=None,
+    ):
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=attn_mask,
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm(tgt)
+
+        return tgt
+
+    def forward_pre(
+        self,
+        tgt,
+        memory,
+        attn_mask=None,
+        memory_key_padding_mask=None,
+        pos=None,
+        query_pos=None,
+    ):
+        tgt2 = self.norm(tgt)
+
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt2, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=attn_mask,
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
+        tgt = tgt + self.dropout(tgt2)
+
+        return tgt
+
+    def forward(
+        self,
+        tgt,
+        memory,
+        attn_mask=None,
+        memory_key_padding_mask=None,
+        pos=None,
+        query_pos=None,
+    ):
+        if self.normalize_before:
+            return self.forward_pre(
+                tgt,
+                memory,
+                attn_mask,
+                memory_key_padding_mask,
+                pos,
+                query_pos,
+            )
+        return self.forward_post(
+            tgt, memory, attn_mask, memory_key_padding_mask, pos, query_pos
+        )
 
 @MODULE_REGISTRY.register()
 class OSE3D(nn.Module):
@@ -87,6 +189,7 @@ class OSE3D(nn.Module):
             spatial_encoder_layer,
             cfg.spatial_encoder.num_layers,
         )
+        self.query_cross_encoder = layer_repeat(CrossAttentionLayer(d_model=hidden_dim, nhead=cfg.spatial_encoder.num_attention_heads, dropout=cfg.spatial_encoder.dropout, activation='relu', normalize_before=False, batch_first=True), cfg.spatial_encoder.num_layers)
         self.pairwise_rel_type = cfg.spatial_encoder.pairwise_rel_type
         self.spatial_dist_norm = cfg.spatial_encoder.spatial_dist_norm
         self.spatial_dim = cfg.spatial_encoder.spatial_dim
@@ -178,23 +281,27 @@ class OSE3D(nn.Module):
                 spatial_dist_norm=self.spatial_dist_norm,
                 spatial_dim=self.spatial_dim,
             )
-
+            
+        query_feat = torch.zeros_like(all_obj_feats)
+        
         for i, pc_layer in enumerate(self.spatial_encoder):
             if self.obj_loc_encoding == 'diff_all':
                 query_pos = self.loc_layers[i](all_obj_locs)
             else:
                 query_pos = self.loc_layers[0](all_obj_locs)
-            if not (self.obj_loc_encoding == 'same_0' and i > 0):
-                all_obj_feats = all_obj_feats + query_pos
+                
+            #if not (self.obj_loc_encoding == 'same_0' and i > 0):
+            #    all_obj_feats = all_obj_feats + query_pos
+            query_feat = self.query_cross_encoder[i](tgt=query_feat, memory=all_obj_feats, memory_key_padding_mask=all_obj_masks, query_pos=query_pos, pos=query_pos) + query_pos
 
             if self.use_spatial_attn:
-                all_obj_feats, _ = pc_layer(
-                    all_obj_feats, pairwise_locs,
+                query_feat, _ = pc_layer(
+                    query_feat, pairwise_locs,
                     tgt_key_padding_mask=all_obj_masks
                 )
             else:
-                all_obj_feats, _ = pc_layer(
-                    all_obj_feats,
+                query_feat, _ = pc_layer(
+                    query_feat,
                     tgt_key_padding_mask=all_obj_masks
                 )
 
